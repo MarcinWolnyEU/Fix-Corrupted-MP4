@@ -1,0 +1,16 @@
+# Third-party tools that fix-vods.js downloads on first run (GPL/LGPL licensed,
+# not part of this repository). Only the placeholder READMEs are tracked.
+untrunc/*
+!untrunc/README.md
+ffmpeg/*
+!ffmpeg/README.md
+untrunc.exe
+
+# video files and repair artifacts
+*.mp4
+*.zip
+
+# OS clutter
+Thumbs.db
+Desktop.ini
+.DS_Store

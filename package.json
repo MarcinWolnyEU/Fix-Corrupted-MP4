@@ -1,0 +1,12 @@
+{
+  "name": "Downloaded Stream Fixer",
+  "version": "1.0.0",
+  "description": "Fix broken MP4 files from interrupted live stream recordings - e.g. from videos downloaded with Video DownloadHelper",
+  "main": "fix-vods.js",
+  "scripts": {
+    "fix": "node fix-vods.js",
+    "fix:help": "node fix-vods.js --help"
+  },
+  "keywords": ["mp4", "fix", "moov", "repair", "video", "stream"],
+  "license": "CC0-1.0"
+}
