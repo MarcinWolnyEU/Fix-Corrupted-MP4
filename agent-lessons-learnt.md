@@ -232,3 +232,30 @@ On Windows, VLC may show "stale plugins cache" errors for every DLL and then han
 1. Delete `C:\Program Files\VideoLAN\VLC\plugins\plugins.dat`
 2. Run `vlc --reset-plugins-cache` with admin privileges
 3. VLC will regenerate the cache file on next launch
+
+## Recordings over 4 GB (64-bit mdat), verified 2026-10-04
+
+Target: a 6.78 GB, 4.9 hour recording whose tool output was "Not an MP4, skipping". Five things were wrong, and a sixth turned up while testing a second broken file.
+
+- **64-bit mdat header:** the layout is `[ftyp 32][mdat: size=1, "mdat", 64-bit size][data from offset 48]`, with no `free` box. `readMp4Boxes` treated size 1 as invalid (< 8), saw no mdat, and the file was classified as not an MP4. The data offset and the mdat size patch in the intermediate file were also hard-coded for the 8-byte header. Both now come from the box that was found.
+- **stco overflow:** offsets past 4 GB need `co64`. The rebuilt moov now switches to it when the last offset exceeds 0xFFFFFFFF.
+- **Relative `-r` path:** untrunc is spawned with `cwd` = the broken file's folder, so `-r ../ref.mp4` failed with "Could not open file". The script now resolves it to an absolute path.
+- **Slow parseAuAt:** it read 200 KB per access unit to look at a few NAL headers, which held the scan to about 340 MB per minute, and it would reject any keyframe over 200 KB. It now reads only the 5-byte header of each NAL.
+- **MIN_AU_SIZE of 500:** it dropped valid frames. Near-static scenes have frames of 53 to 100 bytes. Ground truth on intact files (ffprobe packet count versus scan): 500 gave 51,746 of 51,792 and 402,098 of 407,575; 20 gave both exactly. On the target it recovered 4,432 frames (526,422 versus untrunc's 526,426).
+- **Frame timing comes from the reference:** untrunc copies it, so an unrelated reference (the alphabetically first MP4 in the folder, which is what the old auto-pick chose) gave 12,812 s of video against 10,304 s of audio and the tool still said "fixed". References are now chosen per file by SPS resolution, profile and frame rate, and the output length is checked against frame count divided by the recording's own SPS frame rate. A video that is consistent with that but shorter than the audio is a property of the recording (77 s in one file; the raw data has 307,194 frames, untrunc wrote 307,198).
+
+### Decode check
+
+`ffmpeg -v error -f null -` prints one `non monotonically increasing dts` line per bad timestamp, and it prints the same ones for an intact recording (compared at two positions), so they are noise. The old code counted every stderr line as a harmless DTS warning, which would have hidden real decode errors. They are now counted separately. Both recordings tested end with 3 decode errors from the final cut-off access unit (size 77 and 18 bytes), which is expected.
+
+spawnSync defaults also bit here: `maxBuffer` is 1 MB (one line per timestamp problem can exceed it, which kills ffmpeg and silently truncates the count), and the old 10 minute timeouts are too short for a multi-GB file. Both are raised.
+
+### Practical numbers
+
+- Free space: copy mode needs about twice the recording size (6.80 GB untrunc temp plus 6.80 GB output for a 6.78 GB input).
+- Time on this machine: the video-only rebuild took 3m50s for the 6.78 GB file; the untrunc path took between 4 and 11 minutes end to end, depending on disk load (the disk was nearly full for the slow run).
+- The video-only fallback worked on the 64-bit file once the offsets and header were handled (the scanner counted 521,990 frames before the frame-size fix and 526,422 after).
+
+### Editing gotcha (Windows)
+
+Python's text-mode `open(path, 'w')` writes CRLF on Windows. The repo stores LF, so a scripted edit silently converted all of `fix-vods.js` to CRLF, and one stray NUL byte (from an escaped `\0` in a patch string) made git treat the file as binary. Use `open(path, 'w', newline='')` for scripted edits, and check `git ls-files --eol` afterwards.

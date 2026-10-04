@@ -40,9 +40,11 @@ The script tries two strategies in order.
 
 untrunc reconstructs the `moov` atom using a working MP4 as a template, which preserves both tracks.
 
-The reference has to come from the same source and be in the same format as the broken file: the same video codec, the same audio codec, and the same output format. It does not have to be the same recording, and its length does not matter, so a short clip from the same setup works as well as a long one. A file from a different recorder, or one re-encoded to different codecs, will not work.
+The reference has to come from the same source and be in the same format as the broken file: the same video codec, the same audio codec, the same output format, the same resolution, and the same frame rate. It does not have to be the same recording, and its length does not matter, so a short clip from the same setup works as well as a long one. A file from a different recorder, or one re-encoded to different codecs, will not work.
 
-Pass the reference with `-r`, or simply put the file in the same folder as the broken recordings: any name ending in `.mp4` is picked up automatically, except names ending in `_fixed.mp4`, which are this tool's own output. If it finds none, it explains these requirements and asks for a path, so audio recovery is not skipped silently. The result is re-muxed through ffmpeg to clean up timestamps and produce a standard-compliant file.
+The frame rate matters because untrunc copies the frame timing from the reference. With a reference of the wrong frame rate it still reports success, but the video comes out the wrong length. In one test, a 3.96 GB recording repaired with an unrelated reference gave 12,812 s of video against 10,304 s of audio.
+
+Pass the reference with `-r`, or simply put working recordings in the same folder as the broken ones: any name ending in `.mp4` is a candidate, except names ending in `_fixed.mp4`, which are this tool's own output. Without `-r`, the script reads the resolution, profile, and frame rate from the H.264 SPS inside each broken file and gives every file the best-matching candidate. A candidate with a different resolution, or a frame rate more than 5% off, is never chosen. If nothing matches, the script explains these requirements and asks for a path, so audio recovery is not skipped silently. The result is re-muxed through ffmpeg to clean up timestamps and produce a standard-compliant file.
 
 The script runs untrunc with `-n` (non-interactive) and `-sv` (stretch video to match audio duration, which corrects guessed frame durations).
 
@@ -54,7 +56,9 @@ The framerate is read from the H.264 SPS timing info when the stream carries it.
 
 Audio is lost in this mode. The raw AAC frames between video access units have no framing markers, and the only record of their sizes was in the `moov` that never got written.
 
-This fallback is tuned to OvenMediaEngine-style recordings: AVCC H.264 with access-unit delimiters and `mdat` data starting at file offset 48. Files from other recorders may only work through the untrunc path.
+This fallback is tuned to OvenMediaEngine-style recordings: AVCC H.264 with access-unit delimiters. The script reads where the data starts from the `mdat` header, in both its 8-byte form and the 16-byte 64-bit form that recordings over 4 GB use (offset 48 in both layouts seen so far). Once the data passes 4 GB, it writes the chunk offsets as 64-bit `co64` entries. Files from other recorders may only work through the untrunc path.
+
+The scanner accepts any access unit of 20 bytes or more. Near-static scenes produce real frames of 50 to 100 bytes, and an earlier floor of 500 bytes silently dropped them (5,477 of 407,575 frames in one recording), which made the video shorter and jerky. With the 20-byte floor the scanner's frame count equals ffprobe's packet count on two intact recordings (51,792 and 407,575 frames, one of each `mdat` header layout).
 
 ## Options
 
@@ -62,7 +66,7 @@ This fallback is tuned to OvenMediaEngine-style recordings: AVCC H.264 with acce
 |------|-------------|
 | `-i, --input <path>` | Directory (every MP4 inside is checked) or a single MP4 file. May be repeated. Paths given without `-i` work the same way. Default: current directory |
 | `-o, --output <dir>` | Output directory for fixed files (default: next to each input file) |
-| `-r, --reference <file>` | An intact MP4 from the same source, in the same format (same video codec, same audio codec, same output format). A different clip of any length is fine. Without this flag, the first valid MP4 among the inputs is used, or one found next to the broken files. If there is none, the script asks for a path |
+| `-r, --reference <file>` | An intact MP4 from the same source, in the same format (same video codec, same audio codec, same output format, same resolution and frame rate). A different clip of any length is fine. Used for every file. Without this flag, each broken file gets the best match among the valid MP4s in the inputs and next to the broken files. If none matches, the script asks for a path |
 | `--copy` | Save fixed files as new copies (`*_fixed.mp4`) |
 | `--inplace` | Replace originals after a successful repair |
 | `--no-download` | Never download ffmpeg or untrunc. Use only what is already installed (PATH or the local folders) |
@@ -76,6 +80,12 @@ The script never touches originals in copy mode. Fixed files are written alongsi
 
 Before processing, each file is checked: files with a working `moov` (verified with ffprobe) are skipped, as are `*_fixed.mp4` outputs from earlier runs and files that are not MP4s at all. Broken recordings often pre-allocate `mdat` space and fill only part of it, so the script finds where real data ends and ignores the zero-padding. untrunc output is validated too. If it comes back without a video track, the script falls through to the moov rebuild.
 
+After an untrunc repair the script decodes the whole result with ffmpeg and reports two things separately. DTS warnings (`non monotonically increasing dts`) are harmless: ffmpeg prints the same ones for an intact recording from the same source (identical lines at the two positions compared). Anything else counts as a decode error. A few errors at the very end are normal, because the recording was cut off in the middle of a frame: each of the two recordings tested (3.96 GB and 6.78 GB) gave 3, and in the 6.78 GB one they are the last lines ffmpeg prints, a 77-byte access unit with no picture.
+
+The script also compares the video length with the frame count divided by the recording's own frame rate, and warns when they disagree, which is how a wrong reference shows up. If the video is consistent but shorter than the audio, it says so as a note: the recording itself holds less video than audio (77 s less in one tested file), and nothing can recover the missing frames.
+
+Plan for free disk space of about twice the size of each recording in copy mode. untrunc writes a full-size temporary copy, and the re-mux writes the final file (6.80 GB plus 6.80 GB for a 6.78 GB recording).
+
 ## Technical details
 
 ### Broken file structure
@@ -87,6 +97,14 @@ Broken files from OvenMediaEngine-based recorders look like this:
 ```
 
 The `mdat` size field claims more than the file holds, because the space was pre-allocated but the recording died before it was filled. In the tested files, real data ended around 44% of the file size. Some files also have a large zero-padded prefix (16 to 28 MB) before the data starts.
+
+Recordings over 4 GB use a 64-bit `mdat` header instead, and have no `free` box:
+
+```
+[ftyp: 32 bytes] [mdat header: 16 bytes: size = 1, "mdat", 64-bit size] [real data] [moov: MISSING]
+```
+
+A box size of 1 means the real size follows as a 64-bit value, so a reader that only handles 32-bit sizes sees no `mdat` and rejects the file as "not an MP4". In the tested 6.78 GB file the `mdat` claimed 9.05 GB, and there was no zero padding: the data ran to the last byte of the file. Intact recordings of this kind have the `moov` after the `mdat`.
 
 ### mdat data format
 
@@ -108,7 +126,9 @@ Audio samples are raw AAC-LC frames with no ADTS headers, no length prefixes, an
 - `-sv` stretches video duration to match audio, fixing wrongly guessed frame durations
 - untrunc writes AAC codec warnings to stderr even on success, so stderr is not treated as a failure signal
 - untrunc can fail on files with large zero-padded prefixes ("unable to find correct codec" at the zero boundary). Those fall through to the moov rebuild
-- DTS monotonicity warnings during validation are harmless timestamp artifacts of guessed frame durations
+- DTS monotonicity warnings during validation are harmless timestamp artifacts, and an intact recording from the same source produces the same ones
+- untrunc handled a 6.78 GB recording with a 64-bit `mdat` (6.80 GB output) with the usual `-n -sv` options
+- untrunc runs in the broken file's folder, so a relative reference path would not be found there. The script converts it to an absolute path first
 
 ## License
 

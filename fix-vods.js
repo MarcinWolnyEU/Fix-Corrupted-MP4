@@ -5,8 +5,12 @@ const https = require('https');
 const { spawnSync } = require('child_process');
 const readline = require('readline');
 
-const MDAT_DATA_OFFSET = 48;
 const MAX_NAL = 10 * 1024 * 1024;
+
+// Repairing a multi-GB recording takes minutes. The children's output (ffmpeg prints one
+// line per timestamp problem) can also exceed spawnSync's 1 MB default, which kills the child.
+const TOOL_TIMEOUT = 6 * 60 * 60 * 1000;
+const TOOL_MAX_BUFFER = 512 * 1024 * 1024;
 
 function log(msg) { console.log(`[fix-vods] ${msg}`); }
 function warn(msg) { console.warn(`[fix-vods] WARNING: ${msg}`); }
@@ -201,7 +205,7 @@ function probeFile(f) {
   if (!ffprobeBin) return null;
   try {
     const r = spawnSync(ffprobeBin, ['-v', 'error', '-show_entries',
-      'stream=codec_name,codec_type,width,height,r_frame_rate,sample_rate,channels',
+      'stream=codec_name,codec_type,profile,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels,duration,nb_frames',
       '-show_entries', 'format=duration,size', '-of', 'json', f],
       { encoding: 'utf8', timeout: 30000 });
     return r.status === 0 ? JSON.parse(r.stdout) : null;
@@ -221,23 +225,66 @@ function getRefFps(refPath) {
   return { num: num / g, den: den / g };
 }
 
+function parseRate(r) {
+  const m = /^(\d+)\/(\d+)$/.exec(r || '');
+  return m && +m[2] ? +m[1] / +m[2] : null;
+}
+
+const PROFILE_NAMES = { 66: 'Baseline', 77: 'Main', 88: 'Extended', 100: 'High' };
+
+// How well a working MP4 would serve as untrunc's template for a broken recording.
+// untrunc copies the codec setup AND guesses frame durations from the template, so a
+// template with another resolution or framerate "succeeds" but yields a video whose
+// length no longer matches its audio. Returns -1 for an unusable candidate.
+function scoreReference(want, probe) {
+  if (!probe) return 1;   // ffprobe unavailable: cannot tell, so accept
+  const v = probe && probe.streams && probe.streams.find(x => x.codec_type === 'video');
+  const a = probe && probe.streams && probe.streams.find(x => x.codec_type === 'audio');
+  if (!v || v.codec_name !== 'h264' || !a || a.codec_name !== 'aac') return -1;
+  if (!want) return 1;
+  if (v.width !== want.width || v.height !== want.height) return -1;
+  let score = 100;
+  const fps = parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate);
+  if (want.fps && fps) {
+    if (Math.abs(fps - want.fps) / want.fps > 0.05) return -1;
+    score += 50 - Math.round(Math.abs(fps - want.fps) / want.fps * 500);
+  }
+  const wantProfile = PROFILE_NAMES[want.profile_idc];
+  if (wantProfile && v.profile && v.profile.startsWith(wantProfile)) score += 20;
+  if (+a.sample_rate === 48000) score += 5;   // the audio rate cannot be read from the broken file
+  return score;
+}
+
+// Top-level boxes. A box size of 1 means the real size is a 64-bit value right after
+// the type (recorders use this for an mdat over 4 GB); a size of 0 means "to end of file".
 function readMp4Boxes(filePath) {
   const fd = fs.openSync(filePath, 'r');
-  const fileSize = fs.fstatSync(fd).size;
-  const boxes = [];
-  let offset = 0;
-  const hdr = Buffer.alloc(8);
-  while (offset + 8 <= fileSize) {
-    fs.readSync(fd, hdr, 0, 8, offset);
-    const size = hdr.readUInt32BE(0);
-    const type = hdr.toString('ascii', 4, 8);
-    if (size < 8) break;
-    boxes.push({ type, size, offset });
-    if (offset + size > fileSize) break;
-    offset += size;
+  try {
+    const fileSize = fs.fstatSync(fd).size;
+    const boxes = [];
+    let offset = 0;
+    const hdr = Buffer.alloc(16);
+    while (offset + 8 <= fileSize) {
+      fs.readSync(fd, hdr, 0, 16, offset);
+      let size = hdr.readUInt32BE(0);
+      const type = hdr.toString('ascii', 4, 8);
+      let headerSize = 8;
+      if (size === 1) {
+        if (offset + 16 > fileSize) break;
+        size = Number(hdr.readBigUInt64BE(8));
+        headerSize = 16;
+      } else if (size === 0) {
+        size = fileSize - offset;
+      }
+      if (size < headerSize) break;
+      boxes.push({ type, size, offset, headerSize });
+      if (offset + size > fileSize) break;
+      offset += size;
+    }
+    return { boxes, fileSize };
+  } finally {
+    fs.closeSync(fd);
   }
-  fs.closeSync(fd);
-  return { boxes, fileSize };
 }
 
 function isBrokenMp4(filePath) {
@@ -252,6 +299,10 @@ function isBrokenMp4(filePath) {
   const p = probeFile(filePath);
   if (!p || !p.streams || p.streams.length === 0) return { broken: true, reason: 'moov corrupt' };
   return { broken: false, reason: 'valid' };
+}
+
+function findMdat(filePath) {
+  return readMp4Boxes(filePath).boxes.find(b => b.type === 'mdat') || null;
 }
 
 function verifyAndLog(filePath) {
@@ -335,16 +386,16 @@ function parseSPS(spsBuf) {
   } catch { return null; }
 }
 
-function findDataBoundary(fd, fileSize) {
+function findDataBoundary(fd, fileSize, dataOffset) {
   const probeBuf = Buffer.alloc(256 * 1024);
-  let lo = MDAT_DATA_OFFSET, hi = fileSize;
+  let lo = dataOffset, hi = fileSize;
   while (hi - lo > probeBuf.length) {
     const mid = lo + Math.floor((hi - lo) / 2);
     fs.readSync(fd, probeBuf, 0, probeBuf.length, mid);
     if (probeBuf.every(b => b === 0)) hi = mid; else lo = mid + probeBuf.length;
   }
   const b1 = Buffer.alloc(1);
-  for (let i = Math.max(lo - probeBuf.length, MDAT_DATA_OFFSET); i < hi; i++) {
+  for (let i = Math.max(lo - probeBuf.length, dataOffset); i < hi; i++) {
     fs.readSync(fd, b1, 0, 1, i);
     if (b1[0] === 0) {
       const check = Buffer.alloc(4096);
@@ -355,17 +406,20 @@ function findDataBoundary(fd, fileSize) {
   return fileSize;
 }
 
+// Only the 5-byte header of each NAL (4-byte length + NAL header byte) is read, never the
+// payload, so scanning stays cheap and a keyframe of any size can be measured. A NAL that
+// runs past dataEnd is the truncated tail of the recording and ends the AU.
+const nalHdr = Buffer.alloc(5);
+
 function parseAuAt(fd, filePos, dataEnd) {
-  const bufSize = Math.min(200 * 1024, dataEnd - filePos);
-  if (bufSize < 8) return null;
-  const buf = Buffer.alloc(bufSize);
-  fs.readSync(fd, buf, 0, bufSize, filePos);
+  if (dataEnd - filePos < 8) return null;
   const nalus = [];
   let pos = 0;
-  while (pos + 4 < buf.length) {
-    const len = buf.readUInt32BE(pos);
-    if (len < 2 || len > MAX_NAL || pos + 4 + len > buf.length) break;
-    const hdr = buf[pos + 4];
+  while (filePos + pos + 5 <= dataEnd) {
+    fs.readSync(fd, nalHdr, 0, 5, filePos + pos);
+    const len = nalHdr.readUInt32BE(0);
+    if (len < 2 || len > MAX_NAL || filePos + pos + 4 + len > dataEnd) break;
+    const hdr = nalHdr[4];
     if ((hdr & 0x80) !== 0) break;
     const type = hdr & 0x1f;
     if (type > 31) break;
@@ -383,11 +437,81 @@ function parseAuAt(fd, filePos, dataEnd) {
   };
 }
 
+// Finds the first access unit that carries SPS/PPS: skips a zero-padded prefix (some
+// recordings pre-allocate space they never filled), then scans forward for an AUD pattern.
+function locateFirstAU(fd, dataOffset, dataEnd, say) {
+  say = say || (() => {});
+  // Back up 4 bytes from the first non-zero byte so the zeros of an AVCC length
+  // prefix (00 00 00 xx) are not mistaken for padding.
+  let dataStart = dataOffset;
+  let foundData = false;
+  const probeBuf = Buffer.alloc(256 * 1024);
+  for (let off = dataOffset; off < dataEnd && !foundData; off += probeBuf.length) {
+    const n = Math.min(probeBuf.length, dataEnd - off);
+    fs.readSync(fd, probeBuf, 0, n, off);
+    for (let i = 0; i < n; i++) {
+      if (probeBuf[i] !== 0) {
+        dataStart = Math.max(dataOffset, off + i - 4);
+        foundData = true;
+        break;
+      }
+    }
+  }
+  if (dataStart > dataOffset) say(`  Skipping ${(dataStart / 1024 / 1024).toFixed(1)} MB zero-prefix`);
+
+  // Try to parse an AU at dataStart. If that fails (not valid AVCC), scan forward for an AUD pattern plus SPS.
+  let firstAU = parseAuAt(fd, dataStart, dataEnd);
+  if (!firstAU || !firstAU.hasAUD) {
+    const scanBuf = Buffer.alloc(64 * 1024);
+    let foundStart = -1;
+    for (let off = dataStart; off < dataEnd && foundStart < 0; off += scanBuf.length - 20) {
+      const n = Math.min(scanBuf.length, dataEnd - off);
+      fs.readSync(fd, scanBuf, 0, n, off);
+      for (let i = 0; i < n - 20; i++) {
+        // Look for the AUD pattern: 00 00 00 02 09
+        if (scanBuf[i]===0 && scanBuf[i+1]===0 && scanBuf[i+2]===0 && scanBuf[i+3]===2 && scanBuf[i+4]===9) {
+          const au = parseAuAt(fd, off + i, dataEnd);
+          if (au && au.hasAUD && au.nalus.some(n => n.type === 7)) {
+            foundStart = off + i;
+            firstAU = au;
+            break;
+          }
+        }
+      }
+    }
+    if (foundStart < 0) return null;
+    dataStart = foundStart;
+    say(`  Found first valid AU at ${(dataStart / 1024 / 1024).toFixed(1)} MB`);
+  }
+  return { dataStart, firstAU };
+}
+
+// Resolution, profile and framerate of a broken recording, read from its first SPS.
+// Used to pick a matching reference. Returns null if nothing can be read.
+function readBrokenStreamInfo(filePath) {
+  let fd;
+  try {
+    const mdat = findMdat(filePath);
+    if (!mdat) return null;
+    fd = fs.openSync(filePath, 'r');
+    const located = locateFirstAU(fd, mdat.offset + mdat.headerSize, fs.fstatSync(fd).size);
+    const sps = located && located.firstAU.nalus.find(n => n.type === 7);
+    if (!sps) return null;
+    const buf = Buffer.alloc(sps.length - 1);
+    fs.readSync(fd, buf, 0, buf.length, located.dataStart + sps.relOffset + 5);
+    const info = parseSPS(buf);
+    return info && { ...info, fps: info.fpsNum ? info.fpsNum / info.fpsDen : null };
+  } catch { return null; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
 function scanVideoAUs(fd, firstAU, dataEnd, dataStart) {
-  dataStart = dataStart || MDAT_DATA_OFFSET;
   const videoAUs = [{ offset: dataStart, size: firstAU.totalSize, isKey: firstAU.hasIDR }];
   let pos = dataStart + firstAU.totalSize;
-  const MIN_AU_SIZE = 500;
+  // Near-static scenes produce real frames of only 50-100 bytes. A floor of 500 dropped them
+  // (5477 of 407575 frames on one recording), which shortens the video and makes it jerky.
+  // 20 reproduces ffprobe's packet count exactly on intact recordings.
+  const MIN_AU_SIZE = 20;
   const MAX_AUDIO_GAP = 2048;
   const laBuf = Buffer.alloc(4 * 1024 * 1024);
 
@@ -500,9 +624,15 @@ function buildVideoMoov(videoAUs, spsBuf, spsNaluData, ppsNaluData, spsInfo, tim
   const vStsz = Buffer.alloc(20 + videoAUs.length * 4);
   vStsz.writeUInt32BE(20 + videoAUs.length * 4, 0); vStsz.write('stsz', 4); vStsz.writeUInt32BE(videoAUs.length, 16);
   videoAUs.forEach((au, i) => vStsz.writeUInt32BE(au.size, 20 + i * 4));
-  const vStco = Buffer.alloc(16 + videoAUs.length * 4);
-  vStco.writeUInt32BE(16 + videoAUs.length * 4, 0); vStco.write('stco', 4); vStco.writeUInt32BE(videoAUs.length, 12);
-  videoAUs.forEach((au, i) => vStco.writeUInt32BE(au.offset, 16 + i * 4));
+  // Offsets past 4 GB do not fit in stco, so a long recording needs the 64-bit co64 variant
+  const wide = videoAUs[videoAUs.length - 1].offset > 0xFFFFFFFF;
+  const offSize = wide ? 8 : 4;
+  const vStco = Buffer.alloc(16 + videoAUs.length * offSize);
+  vStco.writeUInt32BE(vStco.length, 0); vStco.write(wide ? 'co64' : 'stco', 4); vStco.writeUInt32BE(videoAUs.length, 12);
+  videoAUs.forEach((au, i) => {
+    if (wide) vStco.writeBigUInt64BE(BigInt(au.offset), 16 + i * 8);
+    else vStco.writeUInt32BE(au.offset, 16 + i * 4);
+  });
 
   // stss: keyframes at the IDR positions found during scanning
   const keyframes = [];
@@ -550,6 +680,30 @@ function buildVideoMoov(videoAUs, spsBuf, spsNaluData, ppsNaluData, spsInfo, tim
   return box('moov', Buffer.concat([mvhd, vTrak]));
 }
 
+// After untrunc: the video length it wrote must agree with the recording's own timing.
+// untrunc copies the frame durations from the reference, so a reference with another
+// framerate gives a video of the wrong length that drifts against the audio. The
+// recording's true timing is the SPS framerate, and the frame count is known.
+function checkAvLength(inputPath, info) {
+  const v = info.streams.find(s => s.codec_type === 'video');
+  const a = info.streams.find(s => s.codec_type === 'audio');
+  const vLen = v ? parseFloat(v.duration) : NaN;
+  const aLen = a ? parseFloat(a.duration) : NaN;
+  if (!isFinite(vLen)) return;
+  const own = readBrokenStreamInfo(inputPath);
+  const frames = v && parseInt(v.nb_frames, 10);
+  if (own && own.fps && frames) {
+    const expected = frames / own.fps;
+    if (Math.abs(vLen - expected) > Math.max(5, expected * 0.01)) {
+      warn(`  The video runs ${vLen.toFixed(0)} s, but its ${frames} frames at the recording's own ${own.fps.toFixed(2)} fps should take ${expected.toFixed(0)} s. untrunc took the frame timing from the reference, which differs from this recording, so video and audio will drift apart. Run again with -r pointing at a working recording from the same source and the same settings.`);
+      return;
+    }
+  }
+  if (isFinite(aLen) && Math.abs(vLen - aLen) > Math.max(5, Math.max(vLen, aLen) * 0.005)) {
+    log(`  Note: the video runs ${vLen.toFixed(0)} s and the audio ${aLen.toFixed(0)} s. The video frame timing is consistent with the recording, so the recording itself holds less video than audio, and the missing frames cannot be recovered.`);
+  }
+}
+
 function fixFile(inputPath, outputDir, ffmpegPath, referencePath, untruncPath, opts) {
   const r = fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPath, opts);
   if (r.status === 'fixed' && opts.inplace) {
@@ -584,7 +738,7 @@ function fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPa
     log(`  Trying untrunc (video + audio recovery)...`);
     try {
       const r = spawnSync(untruncPath, ['-n', '-sv', referencePath, inputPath], {
-        encoding: 'utf8', timeout: 600000, stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf8', timeout: TOOL_TIMEOUT, maxBuffer: TOOL_MAX_BUFFER, stdio: ['pipe', 'pipe', 'pipe'],
         cwd: path.dirname(inputPath)
       });
 
@@ -605,7 +759,7 @@ function fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPa
             '-i', untruncResult,
             '-c', 'copy', '-movflags', '+faststart',
             '-y', outputPath
-          ], { encoding: 'utf8', timeout: 600000 });
+          ], { encoding: 'utf8', timeout: TOOL_TIMEOUT, maxBuffer: TOOL_MAX_BUFFER });
 
           if (remux.status === 0 && fs.existsSync(outputPath)) {
             const info = probeFile(outputPath);
@@ -613,8 +767,13 @@ function fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPa
 
             if (hasVideo) {
               const audErr = spawnSync(ffmpegPath, ['-v', 'error', '-i', outputPath, '-f', 'null', '-'],
-                { encoding: 'utf8', timeout: 600000 });
-              const errCount = (audErr.stderr || '').trim().split('\n').filter(l => l.trim()).length;
+                { encoding: 'utf8', timeout: TOOL_TIMEOUT, maxBuffer: TOOL_MAX_BUFFER });
+              // ffmpeg's null muxer reports non-monotonic DTS even for intact recordings from
+              // this recorder. Anything else it prints is a real decode problem.
+              const checkLines = (audErr.stderr || '').split('\n').filter(l => l.trim());
+              const isDtsLine = l => /non monotonically increasing dts/i.test(l);
+              const dtsWarnings = checkLines.filter(isDtsLine).length;
+              const decodeErrors = checkLines.length - dtsWarnings;
 
               // Clean up untrunc temp files
               try { fs.unlinkSync(untruncResult); } catch {}
@@ -622,12 +781,14 @@ function fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPa
 
               const outSize = fs.statSync(outputPath).size;
               const hasAudio = info.streams.some(s => s.codec_type === 'audio');
+              checkAvLength(inputPath, info);
               log(`  Output: ${fixedName} (${(outSize / 1024 / 1024).toFixed(1)} MB)`);
               for (const s of info.streams) {
                 const dur = s.duration ? ` ${parseFloat(s.duration).toFixed(0)}s` : '';
                 log(`  Track: ${s.codec_type} - ${s.codec_name}${dur}`);
               }
-              if (errCount > 0) log(`  DTS warnings: ${errCount} (harmless timestamp issues)`);
+              if (dtsWarnings > 0) log(`  DTS warnings: ${dtsWarnings} (harmless timestamp issues)`);
+              if (decodeErrors > 0) warn(`  Decode errors: ${decodeErrors} (first: ${checkLines.find(l => !isDtsLine(l))}). A few right at the end are normal: the recording was cut off mid-frame.`);
               return { status: 'fixed', outputPath, method: 'untrunc' + (hasAudio ? '+audio' : '') };
             }
 
@@ -657,58 +818,20 @@ function fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPa
 
   try {
     log(`  Finding data boundary...`);
-    const dataEnd = findDataBoundary(fd, fileSize);
+    const mdat = findMdat(inputPath);
+    if (!mdat) return { status: 'failed', reason: 'no mdat box found' };
+    const dataOffset = mdat.offset + mdat.headerSize;
+    const dataEnd = findDataBoundary(fd, fileSize, dataOffset);
     log(`  Real data: ${(dataEnd / 1024 / 1024).toFixed(1)} MB of ${(fileSize / 1024 / 1024).toFixed(1)} MB`);
 
-    // Skip zero-padded prefix region (some files have pre-allocated but unwritten space).
-    // Back up 4 bytes from the first non-zero byte so the zeros of an AVCC length
-    // prefix (00 00 00 xx) are not mistaken for padding.
-    let dataStart = MDAT_DATA_OFFSET;
-    let foundData = false;
-    const probeBuf = Buffer.alloc(256 * 1024);
-    for (let off = MDAT_DATA_OFFSET; off < dataEnd && !foundData; off += probeBuf.length) {
-      const n = Math.min(probeBuf.length, dataEnd - off);
-      fs.readSync(fd, probeBuf, 0, n, off);
-      for (let i = 0; i < n; i++) {
-        if (probeBuf[i] !== 0) {
-          dataStart = Math.max(MDAT_DATA_OFFSET, off + i - 4);
-          foundData = true;
-          break;
-        }
-      }
-    }
-    if (dataStart > MDAT_DATA_OFFSET) log(`  Skipping ${(dataStart / 1024 / 1024).toFixed(1)} MB zero-prefix`);
-
     log(`  Parsing first AU...`);
-    // Try to parse an AU at dataStart. If that fails (not valid AVCC), scan forward for an AUD pattern plus SPS.
-    let firstAU = parseAuAt(fd, dataStart, dataEnd);
-    if (!firstAU || !firstAU.hasAUD) {
-      // Scan forward for the first valid AU carrying SPS/PPS
-      const scanBuf = Buffer.alloc(64 * 1024);
-      let foundStart = -1;
-      for (let off = dataStart; off < dataEnd && foundStart < 0; off += scanBuf.length - 20) {
-        const n = Math.min(scanBuf.length, dataEnd - off);
-        fs.readSync(fd, scanBuf, 0, n, off);
-        for (let i = 0; i < n - 20; i++) {
-          // Look for the AUD pattern: 00 00 00 02 09
-          if (scanBuf[i]===0 && scanBuf[i+1]===0 && scanBuf[i+2]===0 && scanBuf[i+3]===2 && scanBuf[i+4]===9) {
-            const au = parseAuAt(fd, off + i, dataEnd);
-            if (au && au.hasAUD && au.nalus.some(n => n.type === 7)) {
-              foundStart = off + i;
-              firstAU = au;
-              break;
-            }
-          }
-        }
-      }
-      if (foundStart < 0) return { status: 'failed', reason: 'cannot find a valid H.264 AU with SPS in mdat' };
-      dataStart = foundStart;
-      log(`  Found first valid AU at ${(dataStart / 1024 / 1024).toFixed(1)} MB`);
-    }
+    const located = locateFirstAU(fd, dataOffset, dataEnd, log);
+    if (!located) return { status: 'failed', reason: 'cannot find a valid H.264 AU with SPS in mdat' };
+    const { dataStart, firstAU } = located;
 
     const spsNalu = firstAU.nalus.find(n => n.type === 7);
     const ppsNalu = firstAU.nalus.find(n => n.type === 8);
-    if (!spsNalu) return { status: 'failed', reason: 'no SPS' };
+    if (!spsNalu || !ppsNalu) return { status: 'failed', reason: 'no SPS/PPS' };
 
     const spsBuf = Buffer.alloc(spsNalu.length - 1);
     fs.readSync(fd, spsBuf, 0, spsNalu.length - 1, dataStart + spsNalu.relOffset + 5);
@@ -753,15 +876,18 @@ function fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPa
     // Write intermediate file: ftyp + corrected mdat + moov
     const interName = fileName.replace(/\.mp4$/i, '_inter.mp4');
     const interPath = path.join(outputDir, interName);
-    const header = Buffer.alloc(48);
-    fs.readSync(fd, header, 0, 48, 0);
-    header.writeUInt32BE(writeEnd - 40, 40);
+    // Everything before the data (ftyp, free, the mdat header) is copied as it is, then the
+    // mdat size is corrected: the recorder wrote the size it planned, not the size it got.
+    const header = Buffer.alloc(dataOffset);
+    fs.readSync(fd, header, 0, dataOffset, 0);
+    if (mdat.headerSize === 16) header.writeBigUInt64BE(BigInt(writeEnd - mdat.offset), mdat.offset + 8);
+    else header.writeUInt32BE(writeEnd - mdat.offset, mdat.offset);
 
     log(`  Writing ${(writeEnd / 1024 / 1024).toFixed(1)} MB + moov...`);
     const out = fs.openSync(interPath, 'w');
     fs.writeSync(out, header);
     const copyBuf = Buffer.alloc(4 * 1024 * 1024);
-    let cp = MDAT_DATA_OFFSET;
+    let cp = dataOffset;
     while (cp < writeEnd) {
       const n = Math.min(copyBuf.length, writeEnd - cp);
       fs.readSync(fd, copyBuf, 0, n, cp);
@@ -781,14 +907,14 @@ function fixFileInner(inputPath, outputDir, ffmpegPath, referencePath, untruncPa
           '-c', 'copy', '-movflags', '+faststart',
           '-map', '0:v',
           '-y', outputPath
-        ], { encoding: 'utf8', timeout: 600000, stdio: ['pipe', 'pipe', 'pipe'] });
+        ], { encoding: 'utf8', timeout: TOOL_TIMEOUT, maxBuffer: TOOL_MAX_BUFFER, stdio: ['pipe', 'pipe', 'pipe'] });
 
         if (r.status === 0 && fs.existsSync(outputPath)) {
           const v = ffprobeBin ? spawnSync(ffprobeBin, ['-v', 'error',
             '-show_entries', 'stream=codec_name,codec_type,nb_read_frames,duration',
             '-show_entries', 'format=duration',
             '-of', 'json', outputPath],
-            { encoding: 'utf8', timeout: 600000 }) : null;
+            { encoding: 'utf8', timeout: TOOL_TIMEOUT, maxBuffer: TOOL_MAX_BUFFER }) : null;
           const info = v && v.status === 0 ? JSON.parse(v.stdout) : null;
 
           if (info && info.streams) {
@@ -852,9 +978,10 @@ Options:
   -r, --reference <file>  Intact MP4 used by untrunc as a template for audio+video
                           recovery. Must be from the same source and in the same
                           format: same video codec, same audio codec, same output
-                          format. A different clip of any length is fine. If
-                          omitted, a valid MP4 among the inputs or next to the
-                          broken files is used; failing that, the script asks.
+                          format, same resolution and framerate. A different clip
+                          of any length is fine. If omitted, each broken file gets
+                          the best match among the valid MP4s in the inputs and
+                          next to the broken files; failing that, the script asks.
       --copy              Save fixed files as new copies (*_fixed.mp4)
       --inplace           Replace originals after a successful repair (DANGEROUS)
       --no-download       Never download ffmpeg or untrunc; use only what is installed
@@ -936,26 +1063,53 @@ are missing; the script asks first (see --no-download).
   }
   log(`Skipping ${allFiles.length - brokenFiles.length} already-valid or non-MP4 file(s)`);
 
-  // Reference file: --reference flag, else the first valid MP4 among the inputs,
-  // else a valid MP4 sitting next to the broken files (the usual case when only
-  // broken files were dropped on the launcher).
+  // Reference (untrunc's template): --reference is used for every file. Otherwise one is
+  // chosen per broken file from the working MP4s among the inputs and next to the broken
+  // files (the usual case when only broken files were dropped on the launcher), by how
+  // well its resolution, framerate and profile match the broken recording.
   if (referencePath && !fs.existsSync(referencePath)) {
     warn(`Reference file not found: ${referencePath}`);
     referencePath = null;
   }
-  if (!referencePath && validFiles.length > 0) {
-    referencePath = validFiles[0];
-    log(`Auto-selected reference: ${path.basename(referencePath)} (override with -r)`);
-  }
-  if (!referencePath) {
-    for (const dir of [...new Set(brokenFiles.map(f => path.dirname(f)))]) {
-      const cand = fs.readdirSync(dir).filter(isMp4Name).map(f => path.join(dir, f))
-        .filter(f => !seen.has(path.resolve(f).toLowerCase()))
-        .find(f => { try { return isBrokenMp4(f).reason === 'valid'; } catch { return false; } });
-      if (cand) {
-        referencePath = cand;
-        log(`Auto-selected reference: ${path.basename(cand)} (found next to the broken files; override with -r)`);
-        break;
+  // untrunc is started in each input's folder, so a relative path would resolve there
+  if (referencePath) referencePath = path.resolve(referencePath);
+
+  const picks = new Map();   // broken file -> reference path
+  if (referencePath) {
+    for (const f of brokenFiles) picks.set(f, referencePath);
+  } else {
+    const pool = [...validFiles];
+    const inPool = new Set(pool.map(f => f.toLowerCase()));
+    for (const dir of new Set(brokenFiles.map(f => path.dirname(f)))) {
+      for (const name of fs.readdirSync(dir).filter(isMp4Name)) {
+        const f = path.resolve(path.join(dir, name));
+        if (!seen.has(f.toLowerCase()) && !inPool.has(f.toLowerCase())) { inPool.add(f.toLowerCase()); pool.push(f); }
+      }
+    }
+    const candidates = [];   // working MP4s that could serve as a template
+    for (const f of pool) {
+      if (ffprobeBin) {
+        const pr = probeFile(f);
+        if (pr && pr.streams && pr.streams.length) candidates.push({ file: f, probe: pr });
+      } else {
+        let ok = false;
+        try { ok = isBrokenMp4(f).reason === 'valid'; } catch {}
+        if (ok) candidates.push({ file: f, probe: null });
+      }
+    }
+    for (const f of brokenFiles) {
+      const want = readBrokenStreamInfo(f);
+      const desc = want ? `${want.width}x${want.height}${want.fps ? `, ${want.fps.toFixed(2)} fps` : ''}` : 'format unknown';
+      let best = null, bestScore = 0;
+      for (const c of candidates) {
+        const sc = scoreReference(want, c.probe);
+        if (sc > bestScore) { best = c; bestScore = sc; }
+      }
+      if (best) {
+        picks.set(f, best.file);
+        log(`Reference for ${path.basename(f)}: ${path.basename(best.file)} (${want ? desc + ' match' : 'no way to compare'}; override with -r)`);
+      } else if (candidates.length) {
+        warn(`None of the ${candidates.length} working MP4 file(s) matches ${path.basename(f)} (${desc})`);
       }
     }
   }
@@ -984,10 +1138,11 @@ are missing; the script asks first (see --no-download).
 
   if (!untruncPath) warn('untrunc unavailable; only the video track can be recovered');
 
-  if (!referencePath && untruncPath) {
+  const unmatched = brokenFiles.filter(f => !picks.get(f));
+  if (unmatched.length && untruncPath) {
     const dirs = [...new Set(brokenFiles.map(f => path.dirname(f)))];
     console.log('');
-    console.log('  No working recording was found next to the broken files.');
+    console.log(picks.size ? '  No working recording matching some of the broken files was found.' : '  No matching working recording was found next to the broken files.');
     console.log('');
     console.log('  To recover audio, untrunc needs one intact MP4 to use as a template. It has');
     console.log('  to come from the same source and be in the same format: the same video codec,');
@@ -1009,15 +1164,16 @@ are missing; the script asks first (see --no-download).
       else {
         let ok = false;
         try { ok = isBrokenMp4(ans).reason === 'valid'; } catch {}
-        if (ok) { referencePath = path.resolve(ans); log(`Using reference: ${path.basename(referencePath)}`); }
+        if (ok) {
+          for (const f of unmatched) picks.set(f, path.resolve(ans));
+          log(`Using reference: ${path.basename(ans)}`);
+        }
         else warn(`Not a working MP4, ignoring it: ${path.basename(ans)}`);
       }
     }
     console.log('');
   }
-  if (!referencePath) warn('No working reference file; untrunc audio recovery unavailable');
-
-  const refFps = referencePath ? getRefFps(referencePath) : null;
+  if (brokenFiles.some(f => !picks.get(f))) warn('No working reference file for some files; untrunc audio recovery unavailable for them');
 
   if (!outputMode) outputMode = await promptOutputMode();
   closeQuestions();   // no more prompts from here on
@@ -1027,15 +1183,16 @@ are missing; the script asks first (see --no-download).
   log(`Mode: ${outputMode === 'copy' ? 'new copies (*_fixed.mp4)' : 'IN-PLACE REPLACE'}`);
   log(`ffmpeg: ${ffmpegPath || 'not found'}`);
   log(`untrunc: ${untruncPath || 'not found'}`);
-  log(`Reference: ${referencePath ? path.basename(referencePath) : 'none'}`);
+  log(`Reference: ${referencePath ? path.basename(referencePath) : picks.size ? 'chosen per file' : 'none'}`);
   log(`Output: ${outputDir || 'next to each file'}`);
   console.log('');
 
-  const opts = { inplace: outputMode === 'inplace', refFps };
   const results = { fixed: 0, skipped: 0, failed: 0 };
   for (const file of brokenFiles) {
     log(`Processing: ${path.basename(file)}`);
-    const r = fixFile(file, outputDir || path.dirname(file), ffmpegPath, referencePath, untruncPath, opts);
+    const ref = picks.get(file) || null;
+    const opts = { inplace: outputMode === 'inplace', refFps: ref ? getRefFps(ref) : null };
+    const r = fixFile(file, outputDir || path.dirname(file), ffmpegPath, ref, untruncPath, opts);
     console.log('');
     if (r.status === 'fixed') results.fixed++;
     else if (r.status === 'skipped') results.skipped++;
